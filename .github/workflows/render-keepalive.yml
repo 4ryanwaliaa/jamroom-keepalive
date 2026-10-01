@@ -1,0 +1,67 @@
+name: Jam Room Render keep-alive
+
+on:
+  schedule:
+    # Avoid the busy start of each hour.
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: render-keepalive
+  cancel-in-progress: false
+
+jobs:
+  health:
+    name: Check Render health
+    # A missing URL skips before allocating a runner.
+    if: ${{ vars.RENDER_HEALTH_URL != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: One unauthenticated health request
+        env:
+          RENDER_HEALTH_URL: ${{ vars.RENDER_HEALTH_URL }}
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          const target = process.env.RENDER_HEALTH_URL ?? '';
+          const allowed = /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.onrender\.com\/health$/;
+          if (!allowed.test(target)) {
+            console.error('Configure RENDER_HEALTH_URL with the real HTTPS Render /health URL.');
+            process.exit(1);
+          }
+          try {
+            const response = await fetch(target, {
+              method: 'GET', redirect: 'manual', credentials: 'omit',
+              headers: { Accept: 'application/json' },
+              signal: AbortSignal.timeout(90000),
+            });
+            if (response.status !== 200 || !response.body) {
+              await response.body?.cancel();
+              throw new Error('Unexpected health response');
+            }
+            const reader = response.body.getReader();
+            const chunks = [];
+            let size = 0;
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              size += value.byteLength;
+              if (size > 65536) {
+                await reader.cancel();
+                throw new Error('Health response exceeded the size limit');
+              }
+              chunks.push(Buffer.from(value));
+            }
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            if (!body || Array.isArray(body) || body.status !== 'ok') {
+              throw new Error('Unexpected health status');
+            }
+            console.log('Jam Room backend is healthy.');
+          } catch {
+            console.error('Jam Room health check failed. Check the Render deployment.');
+            process.exitCode = 1;
+          }
+          NODE
